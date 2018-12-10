@@ -31,14 +31,15 @@ DEFINE_int32(chash_num_replicas, 100,
 
 ConsistentHashingLoadBalancer::ConsistentHashingLoadBalancer(HashFunc hash) 
     : _hash(hash)
+    , _build_replicas(BuildReplicasDefault)
     , _num_replicas(FLAGS_chash_num_replicas) {
 }
 
 ConsistentHashingLoadBalancer::ConsistentHashingLoadBalancer(
-        HashFunc hash,
-        size_t num_replicas) 
-    : _hash(hash)
-    , _num_replicas(num_replicas) {
+        BuildReplicasFunc build_replicas) 
+    : _hash(nullptr)
+    , _build_replicas(build_replicas)
+    , _num_replicas(FLAGS_chash_num_replicas) {
 }
 
 size_t ConsistentHashingLoadBalancer::AddBatch(
@@ -112,19 +113,8 @@ size_t ConsistentHashingLoadBalancer::Remove(
 bool ConsistentHashingLoadBalancer::AddServer(const ServerId& server) {
     std::vector<Node> add_nodes;
     add_nodes.reserve(_num_replicas);
-    SocketUniquePtr ptr;
-    if (Socket::AddressFailedAsWell(server.id, &ptr) == -1) {
+    if (!_build_replicas(server, _num_replicas, &add_nodes)) {
         return false;
-    }
-    for (size_t i = 0; i < _num_replicas; ++i) {
-        char host[32];
-        int len = snprintf(host, sizeof(host), "%s-%lu", 
-                 endpoint2str(ptr->remote_side()).c_str(), i);
-        Node node;
-        node.hash = _hash(host, len);
-        node.server_sock = server;
-        node.server_addr = ptr->remote_side();
-        add_nodes.push_back(node);
     }
     std::sort(add_nodes.begin(), add_nodes.end());
     bool executed = false;
@@ -138,24 +128,14 @@ size_t ConsistentHashingLoadBalancer::AddServersInBatch(
     const std::vector<ServerId> &servers) {
     std::vector<Node> add_nodes;
     add_nodes.reserve(servers.size() * _num_replicas);
+		std::vector<Node> replicas;
+		add_nodes.reserve(_num_replicas)
     for (size_t i = 0; i < servers.size(); ++i) {
-        SocketUniquePtr ptr;
-        if (Socket::AddressFailedAsWell(servers[i].id, &ptr) == -1) {
-            continue;
-        }
-        for (size_t rep = 0; rep < _num_replicas; ++rep) {
-            char host[32];
-            // To be compatible with libmemcached, we formulate the key of
-            // a virtual node as `|address|-|replica_index|', see
-            // http://fe.baidu.com/-1bszwnf at line 297.
-            int len = snprintf(host, sizeof(host), "%s-%lu",
-                              endpoint2str(ptr->remote_side()).c_str(), rep);
-            Node node;
-            node.hash = _hash(host, len);
-            node.server_sock = servers[i];
-            node.server_addr = ptr->remote_side();
-            add_nodes.push_back(node);
-        }
+        replicas.clear();
+			  if (_build_replicas(server[i], _num_replicas, &replicas)) {
+            add_nodes.insert(add_nodes.end(), replicas.begin(), replicas.end());
+			      ++n;
+			  }
     }
     std::sort(add_nodes.begin(), add_nodes.end());
     bool executed = false;
@@ -287,6 +267,39 @@ void ConsistentHashingLoadBalancer::GetLoads(
             it = count_map.begin(); it!= count_map.end(); ++it) {
         (*load_map)[it->first] = (double)it->second / UINT_MAX;
     }
+}
+
+bool ConsistentHashingLoadBalancer::BuildReplicasDefault(
+    const ServerId server, const size_t num_replicas, std::vector<Node>* replicas) {
+    SocketUniquePtr ptr;
+    if (Socket::AddressFailedAsWell(server.id, &ptr) == -1) {
+        return false;
+    }
+    for (size_t i = 0; i < num_replicas; ++i) {
+        char host[32];
+        int len = snprintf(host, sizeof(host), "%s-%lu", 
+                 endpoint2str(ptr->remote_side()).c_str(), i);
+        Node node;
+        node.hash = _hash(host, len);
+        node.server_sock = server;
+        node.server_addr = ptr->remote_side();
+        replicas->push_back(node);
+    }
+}
+
+bool ConsistentHashingLoadBalancer::SetParameters(const butil::StringPairs& parms) {
+    for (const std::pair<std::string, std::string>& parm : parms) {
+        if (parm.first == "replicas") {
+            size_t replicas = 0;
+            if (butil::StringToSizeT(parm.second, &replicas)) {
+                _num_replicas = replicas;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 }  // namespace policy
