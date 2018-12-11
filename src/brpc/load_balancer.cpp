@@ -77,7 +77,10 @@ int SharedLoadBalancer::Init(const char* lb_protocol) {
         return -1;
     }
     _lb = lb_copy;
-    _lb->SetParameters(lb_parms);
+    if (!_lb->SetParameters(lb_parms)) {
+        LOG(FATAL) << "Fail to set parameters of lb `" << lb_protocol << "'";
+        return -1;
+    }
     if (FLAGS_show_lb_in_vars && !_exposed) {
         ExposeLB();
     }
@@ -98,14 +101,14 @@ void SharedLoadBalancer::ParseParameters(const butil::StringPiece lb_protocol,
                                          butil::StringPairs* parms) {
     lb_name->clear();
     parms->clear();
-		size_t pos = lb_protocol.find("://");
+    size_t pos = lb_protocol.find(':');
     if (pos == std::string::npos) {
         lb_name->append(lb_protocol.data(), lb_protocol.size());
     } else {
         lb_name->append(lb_protocol.data(), pos);
-        butil::StringPiece parms_piece = lb_protocol.substr(pos + sizeof("://"));
+        butil::StringPiece parms_piece = lb_protocol.substr(pos + sizeof(':'));
         std::string parms_str(parms_piece.data(), parms_piece.size());
-        butil::SplitStringIntoKeyValuePairs(parms_str, ' ', '=', parms);
+        butil::SplitStringIntoKeyValuePairs(parms_str, '=', ' ', parms);
     }
 }
 																				 

@@ -18,8 +18,10 @@
 #include <gflags/gflags.h>
 #include "butil/containers/flat_map.h"
 #include "butil/errno.h"
+#include "butil/strings/string_number_conversions.h"
 #include "brpc/socket.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
+#include "brpc/policy/hasher.h"
 
 
 namespace brpc {
@@ -29,17 +31,92 @@ namespace policy {
 DEFINE_int32(chash_num_replicas, 100, 
              "default number of replicas per server in chash");
 
-ConsistentHashingLoadBalancer::ConsistentHashingLoadBalancer(HashFunc hash) 
-    : _hash(hash)
-    , _build_replicas(BuildReplicasDefault)
-    , _num_replicas(FLAGS_chash_num_replicas) {
+namespace {
+
+using HashFun = uint32_t(*)(const void*, size_t);
+
+bool BuildReplicasDefault(const ServerId server,
+                          const size_t num_replicas,
+                          HashFun hash,
+                          std::vector<ConsistentHashingLoadBalancer::Node>* replicas) {
+    SocketUniquePtr ptr;
+    if (Socket::AddressFailedAsWell(server.id, &ptr) == -1) {
+        return false;
+    }
+    replicas->clear();
+    for (size_t i = 0; i < num_replicas; ++i) {
+        char host[32];
+        int len = snprintf(host, sizeof(host), "%s-%lu",
+                           endpoint2str(ptr->remote_side()).c_str(), i);
+        ConsistentHashingLoadBalancer::Node node;
+        node.hash = hash(host, len);
+        node.server_sock = server;
+        node.server_addr = ptr->remote_side();
+        replicas->push_back(node);
+    }
+    return true;
 }
 
-ConsistentHashingLoadBalancer::ConsistentHashingLoadBalancer(
-        BuildReplicasFunc build_replicas) 
-    : _hash(nullptr)
-    , _build_replicas(build_replicas)
-    , _num_replicas(FLAGS_chash_num_replicas) {
+bool BuildReplicasKetam(const ServerId server,
+                        const size_t num_replicas,
+                        std::vector<ConsistentHashingLoadBalancer::Node>* replicas) {
+    SocketUniquePtr ptr;
+    if (Socket::AddressFailedAsWell(server.id, &ptr) == -1) {
+        return false;
+    }
+    replicas->clear();
+    const size_t points_per_hash = 4;
+    CHECK(num_replicas % points_per_hash == 0)
+        << "Ketam hash replicas number(" << num_replicas << ") should be n*4";
+    for (size_t i = 0; i < num_replicas / points_per_hash; ++i) {
+        char host[32];
+        int len = snprintf(host, sizeof(host), "%s-%lu",
+                           endpoint2str(ptr->remote_side()).c_str(), i);
+        unsigned char digest[16];
+        MD5HashSignature(host, len, digest);
+        for (size_t j = 0; j < points_per_hash; ++j) {
+            ConsistentHashingLoadBalancer::Node node;
+            node.server_sock = server;
+            node.server_addr = ptr->remote_side();
+            node.hash = ((uint32_t) (digest[3 + j * 4] & 0xFF) << 24)
+                      | ((uint32_t) (digest[2 + j * 4] & 0xFF) << 16)
+                      | ((uint32_t) (digest[1 + j * 4] & 0xFF) << 8)
+                      | (digest[0 + j * 4] & 0xFF);
+            replicas->push_back(node);
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+ConsistentHashingLoadBalancer::ConsistentHashingLoadBalancer(const char* name)
+    : _num_replicas(FLAGS_chash_num_replicas), _name(name) {
+    Init(_name);
+}
+
+void ConsistentHashingLoadBalancer::Init(const std::string& name) {
+    if (name.compare("murmurhash3") == 0) {
+        _build_replicas = std::bind(BuildReplicasDefault,
+                                    std::placeholders::_1,
+                                    std::placeholders::_2,
+                                    MurmurHash32,
+                                    std::placeholders::_3);
+        return;
+    }
+    if (name.compare("md5") == 0) {
+        _build_replicas = std::bind(BuildReplicasDefault,
+                                    std::placeholders::_1,
+                                    std::placeholders::_2,
+                                    MD5Hash32,
+                                    std::placeholders::_3);
+        return;
+    }
+    if (name.compare("ketama") == 0) {
+        _build_replicas = BuildReplicasKetam;
+        return;
+    }
+    CHECK(false) << "Failed to init consistency hash load balancer of \'" << name << '\'';
 }
 
 size_t ConsistentHashingLoadBalancer::AddBatch(
@@ -128,14 +205,13 @@ size_t ConsistentHashingLoadBalancer::AddServersInBatch(
     const std::vector<ServerId> &servers) {
     std::vector<Node> add_nodes;
     add_nodes.reserve(servers.size() * _num_replicas);
-		std::vector<Node> replicas;
-		add_nodes.reserve(_num_replicas)
+    std::vector<Node> replicas;
+    replicas.reserve(_num_replicas);
     for (size_t i = 0; i < servers.size(); ++i) {
         replicas.clear();
-			  if (_build_replicas(server[i], _num_replicas, &replicas)) {
+        if (_build_replicas(servers[i], _num_replicas, &replicas)) {
             add_nodes.insert(add_nodes.end(), replicas.begin(), replicas.end());
-			      ++n;
-			  }
+        }
     }
     std::sort(add_nodes.begin(), add_nodes.end());
     bool executed = false;
@@ -168,7 +244,7 @@ size_t ConsistentHashingLoadBalancer::RemoveServersInBatch(
 }
 
 LoadBalancer *ConsistentHashingLoadBalancer::New() const {
-    return new (std::nothrow) ConsistentHashingLoadBalancer(_hash);
+    return new (std::nothrow) ConsistentHashingLoadBalancer(_name.c_str());
 }
 
 void ConsistentHashingLoadBalancer::Destroy() {
@@ -212,8 +288,6 @@ int ConsistentHashingLoadBalancer::SelectServer(
     return EHOSTDOWN;
 }
 
-extern const char *GetHashName(uint32_t (*hasher)(const void* key, size_t len));
-
 void ConsistentHashingLoadBalancer::Describe(
     std::ostream &os, const DescribeOptions& options) {
     if (!options.verbose) {
@@ -221,7 +295,7 @@ void ConsistentHashingLoadBalancer::Describe(
         return;
     }
     os << "ConsistentHashingLoadBalancer {\n"
-       << "  hash function: " << GetHashName(_hash) << '\n'
+       << "  hash function: " << _name << '\n'
        << "  replica per host: " << _num_replicas << '\n';
     std::map<butil::EndPoint, double> load_map;
     GetLoads(&load_map);
@@ -269,33 +343,17 @@ void ConsistentHashingLoadBalancer::GetLoads(
     }
 }
 
-bool ConsistentHashingLoadBalancer::BuildReplicasDefault(
-    const ServerId server, const size_t num_replicas, std::vector<Node>* replicas) {
-    SocketUniquePtr ptr;
-    if (Socket::AddressFailedAsWell(server.id, &ptr) == -1) {
-        return false;
-    }
-    for (size_t i = 0; i < num_replicas; ++i) {
-        char host[32];
-        int len = snprintf(host, sizeof(host), "%s-%lu", 
-                 endpoint2str(ptr->remote_side()).c_str(), i);
-        Node node;
-        node.hash = _hash(host, len);
-        node.server_sock = server;
-        node.server_addr = ptr->remote_side();
-        replicas->push_back(node);
-    }
-}
-
 bool ConsistentHashingLoadBalancer::SetParameters(const butil::StringPairs& parms) {
     for (const std::pair<std::string, std::string>& parm : parms) {
-        if (parm.first == "replicas") {
+        if (parm.first.compare("replicas") == 0) {
             size_t replicas = 0;
             if (butil::StringToSizeT(parm.second, &replicas)) {
                 _num_replicas = replicas;
             } else {
                 return false;
             }
+        } else {
+            return false;
         }
     }
 
