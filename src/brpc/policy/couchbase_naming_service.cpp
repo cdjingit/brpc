@@ -221,6 +221,10 @@ void* CouchbaseServerListener::ListenThread(void* arg) {
                 << cntl.ErrorText() << "\' stream_uri=\'" 
                 << butil::endpoint2str(cntl.remote_side()) 
                 << listener->_streaming_url << '\'';
+            if (bthread_stopped(bthread_self())) {
+                RPC_VLOG << "ListenThread is stopped";
+                break;
+            }
             if (bthread_usleep(FLAGS_couchbase_listen_interval_ms * 1000) < 0) {
                 if (errno == ESTOP) {
                     LOG(INFO) << "ListenThread is stopped.";
