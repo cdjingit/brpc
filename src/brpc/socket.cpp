@@ -2584,6 +2584,7 @@ int SocketMulti::GetSocket(SocketUniquePtr* ptr_out) {
                 ptr->_multi_index = i;
                 if (psid->compare_exchange_strong(
                         sid, new_id, butil::memory_order_relaxed)) {
+                    ShareStatsForNewSocket(ptr.get());
                     ptr->_rpc_count.fetch_add(1, butil::memory_order_relaxed);
                     _lightest.store(BuildLightest(i, 0), butil::memory_order_relaxed);
                     ptr_out->reset(ptr.release());
@@ -2651,8 +2652,13 @@ int SocketMulti::InitSocket(const size_t index, SocketId* sid) {
         final_pos = count;
         if (!ptr) {
             psid = reinterpret_cast<butil::atomic<SocketId>*>(&_multi[final_pos]);
-            psid->store(INVALID_SOCKET_ID - 1, butil::memory_order_relaxed);
-            return -1;
+            if (psid->compare_exchange_strong(dummy, INVALID_SOCKET_ID - 1,
+				    butil::memory_order_relaxed)) {
+		return -1;
+            } else {
+                *sid = dummy;
+                return 1;
+            } 
         } 
     } else {
         _num_created.fetch_sub(1, butil::memory_order_relaxed);
